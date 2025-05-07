@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackpal/bencode-go"
@@ -216,7 +217,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	announceResp := make([]byte, 20)
+	announceResp := make([]byte, 1220) // for 10 as 10 * 6 = 60 + 20 = 80
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, err = conn.Read(announceResp)
 	if err != nil {
@@ -231,10 +232,83 @@ func main() {
 
 	fmt.Printf("My Announce Transaction Id is: %x\n", announceTransactionId)
 	fmt.Printf("Tracker Announce Transaction Id is: %x\n", recieved_announce_transaction_id)
-	fmt.Printf("Tracker Announce Action: %x\n", recieved_announce_action)
-	fmt.Printf("Tracker Announce Interval is: %x\n", recieved_announce_interval)
-	fmt.Printf("Tracker Announce Leechers is: %x\n", recieved_announce_leechers)
-	fmt.Printf("Tracker Announce Seeders is: %x\n", recieved_announce_seeders)
+	fmt.Printf("Tracker Announce Action: %d\n", binary.BigEndian.Uint32(recieved_announce_action))
+	fmt.Printf("Tracker Announce Interval is: %d\n", binary.BigEndian.Uint32(recieved_announce_interval))
+	fmt.Printf("Tracker Announce Leechers is: %d\n", binary.BigEndian.Uint32(recieved_announce_leechers))
+	fmt.Printf("Tracker Announce Seeders is: %d\n", binary.BigEndian.Uint32(recieved_announce_seeders))
 	fmt.Printf("Tracker rest is: %x\n", announceResp[20:])
+	peerData := announceResp[20:]
+	if len(peerData)%6 != 0 {
+		fmt.Println("Error: Peer data length is not a multiple of 6.")
+	} else {
+		numberOfPeersN := len(peerData) / 6
+		fmt.Printf("Number of peers (N): %d\n", numberOfPeersN)
+		var wg sync.WaitGroup
+		concurrencyLimit := 50
+		semaphore := make(chan struct{}, concurrencyLimit)
+		for i := 0; i < numberOfPeersN; i++ {
+			offset := i * 6
 
+			ipBytes := peerData[offset : offset+4]
+			ipAddr := net.IP(ipBytes)
+
+			portBytes := peerData[offset+4 : offset+6]
+			port := binary.BigEndian.Uint16(portBytes)
+			wg.Add(1)
+			semaphore <- struct{}{}
+			go func(ip net.IP, port uint16, info_hash []byte, peerId []byte) {
+				defer wg.Done()
+				connectToPeer(ip, port, info_hash, peerId) // A version of connectToPeer that doesn't manage wg
+				<-semaphore                                // Release the slot
+			}(ipAddr, port, info_hash, peerId[:])
+		}
+		wg.Wait()
+		fmt.Println("All Peer Connections Finished")
+	}
+
+}
+
+func connectToPeer(peerIp net.IP, peerPort uint16, info_hash []byte, peerId []byte) {
+	address := net.JoinHostPort(peerIp.String(), fmt.Sprintf("%d", peerPort))
+	// fmt.Printf("Attempting to connect to peer at %s\n", address)
+
+	conn, err := net.DialTimeout("tcp", address, 10*time.Second) // 10-second timeout
+	if err != nil {
+		// fmt.Printf("dial tcp %s: %v\n", address, err)
+		return
+	}
+	defer conn.Close()
+
+	fmt.Printf("Successfully connected to peer: %s\n", address)
+	fmt.Printf("  Raw IP Bytes: %x\n", []byte(peerIp.To4()))
+	fmt.Printf("  IP Address: %s\n", peerIp.String())
+	fmt.Printf("  Raw Port Bytes: %x\n", []byte{byte(peerPort >> 8), byte(peerPort)})
+	fmt.Printf("  Port: %d\n", peerPort)
+	fmt.Println("-----------------")
+	var buf bytes.Buffer
+	buf.WriteByte(19)
+	buf.WriteString("BitTorrent protocol")
+	buf.Write(make([]byte, 8))
+	buf.Write(info_hash)
+	buf.Write(peerId)
+	_, err = conn.Write(buf.Bytes())
+	if err != nil {
+		fmt.Println("Failed to send handshake:", err)
+		return
+	}
+	handshakeResp := make([]byte, 68)
+	_, err = conn.Read(handshakeResp)
+	if err != nil {
+		fmt.Println("Failed to read handshake response:", err)
+		return
+	}
+	pstrlen := handshakeResp[0]
+	protocol := string(handshakeResp[1 : 1+int(pstrlen)])
+	respInfoHash := handshakeResp[28:48]
+	respPeerID := handshakeResp[48:68]
+
+	fmt.Println("Received handshake:")
+	fmt.Println("Protocol:", protocol)
+	fmt.Printf("Info Hash: %x\n", respInfoHash)
+	fmt.Printf("Peer ID: %s\n", respPeerID)
 }
